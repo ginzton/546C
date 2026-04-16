@@ -12,8 +12,9 @@ Layers:
 from __future__ import annotations
 
 import math
+import json
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 try:
@@ -41,6 +42,7 @@ class Params:
 
 
 DEFAULT = Params()
+STATE_PATH = Path(__file__).resolve().with_name(".multilayer_pattern_gui_state.json")
 
 FIELD_ROWS: tuple[tuple[str, str, str], ...] = (
     ("n_rings", "n_rings", "int"),
@@ -225,9 +227,8 @@ def _svg_header(p: Params, title: str) -> tuple[list[str], float]:
     size = 2 * extent
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb} {vb} {size} {size}" width="920" height="920">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb} {vb} {size} {size}" width="{size:.6g}cm" height="{size:.6g}cm">',
         f"<title>{_xml_escape(title)}</title>",
-        f'<rect x="{vb}" y="{vb}" width="{size}" height="{size}" fill="#ffffff"/>',
     ]
     return parts, extent
 
@@ -237,8 +238,15 @@ def build_svg_fabric_rings(p: Params) -> str:
     parts, _ = _svg_header(p, "Layer 1 - fabric_rings")
     parts.append('<g id="fabric_rings">')
     for rc in centers:
+        r_in = rc - p.w_rings / 2.0
+        r_out = rc + p.w_rings / 2.0
+        if r_in <= 0:
+            raise ValueError("Ring inner outline radius must be > 0. Reduce w_rings or increase smallest radius.")
         parts.append(
-            f'<circle cx="0" cy="0" r="{rc:.6g}" fill="none" stroke="#1f4e79" stroke-width="{p.w_rings:.6g}"/>'
+            f'<circle cx="0" cy="0" r="{r_in:.6g}" fill="none" stroke="#1f4e79" stroke-width="0.05"/>'
+        )
+        parts.append(
+            f'<circle cx="0" cy="0" r="{r_out:.6g}" fill="none" stroke="#1f4e79" stroke-width="0.05"/>'
         )
     parts.append("</g></svg>")
     return "\n".join(parts)
@@ -250,19 +258,19 @@ def build_svg_fabric_slices(p: Params) -> str:
         [
             "<defs>",
             '<style type="text/css"><![CDATA[',
-            ".slice { fill: #d97706; fill-opacity: 0.45; stroke: #b45309; stroke-width: 0.05; }",
-            ".strip-cut { fill: #ffffff; stroke: none; }",
+            ".slice-outline { fill: none; stroke: #b45309; stroke-width: 0.05; }",
+            ".strip-outline { fill: none; stroke: #1d4ed8; stroke-width: 0.04; }",
             "]]></style>",
             "</defs>",
-            '<g id="fabric_slices">',  # A
+            '<g id="fabric_slices_outline">',
         ]
     )
     for r0, r1, cdeg, sp in iter_electrode_slices(p):
-        parts.append(f'<path class="slice" d="{annular_sector_path(r0, r1, cdeg, sp)}"/>')
+        parts.append(f'<path class="slice-outline" d="{annular_sector_path(r0, r1, cdeg, sp)}"/>')
     parts.append("</g>")
-    parts.append('<g id="strip_cuts">')  # subtractive visual C
+    parts.append('<g id="fabric_strips_outline">')
     for i in range(p.n_beat_steps):
-        parts.append(f'<path class="strip-cut" d="{closed_polygon_path(strip_polygon_vertices(i, p))}"/>')
+        parts.append(f'<path class="strip-outline" d="{closed_polygon_path(strip_polygon_vertices(i, p))}"/>')
     parts.append("</g></svg>")
     return "\n".join(parts)
 
@@ -284,8 +292,15 @@ def build_svg_wood_engraving(p: Params) -> str:
         ]
     )
     for rc in centers:
+        r_in = rc - p.w_rings / 2.0
+        r_out = rc + p.w_rings / 2.0
+        if r_in <= 0:
+            raise ValueError("Ring inner outline radius must be > 0. Reduce w_rings or increase smallest radius.")
         parts.append(
-            f'<circle class="ring" cx="0" cy="0" r="{rc:.6g}" stroke-width="{p.w_rings:.6g}"/>'
+            f'<circle class="ring" cx="0" cy="0" r="{r_in:.6g}" stroke-width="0.05"/>'
+        )
+        parts.append(
+            f'<circle class="ring" cx="0" cy="0" r="{r_out:.6g}" stroke-width="0.05"/>'
         )
     parts.append("</g>")
     parts.append('<g id="engraving_slice_outlines">')
@@ -312,8 +327,8 @@ def build_svg_wood_cutthrough(p: Params) -> str:
             "<defs>",
             '<style type="text/css"><![CDATA[',
             ".cut { fill: none; stroke: #111111; stroke-width: 0.06; }",
-            ".via-ring { fill: #111111; stroke: none; }",
-            ".via-slice { fill: #111111; stroke: none; }",
+            ".via-ring { fill: none; stroke: #111111; stroke-width: 0.04; }",
+            ".via-slice { fill: none; stroke: #111111; stroke-width: 0.04; }",
             "]]></style>",
             "</defs>",
             '<g id="cut_through_circle">',
@@ -349,6 +364,40 @@ def _read_params(vars_map: dict[str, tk.StringVar]) -> Params:
     return Params(**kwargs)
 
 
+def _load_last_params() -> Params:
+    """
+    Load persisted params from disk; fall back to defaults on any error.
+    """
+    try:
+        if not STATE_PATH.exists():
+            return DEFAULT
+        raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return DEFAULT
+        kwargs = asdict(DEFAULT)
+        for key, _label, kind in FIELD_SPEC:
+            if key not in raw:
+                continue
+            val = raw[key]
+            if kind == "int":
+                kwargs[key] = int(val)
+            else:
+                kwargs[key] = float(val)
+        return Params(**kwargs)
+    except (OSError, ValueError, TypeError):
+        return DEFAULT
+
+
+def _save_params(p: Params) -> None:
+    """
+    Persist params to disk; ignore I/O failures to keep UX smooth.
+    """
+    try:
+        STATE_PATH.write_text(json.dumps(asdict(p), indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _validate(p: Params) -> str | None:
     if p.n_rings < 1:
         return "n_rings must be at least 1."
@@ -374,6 +423,8 @@ def _validate(p: Params) -> str | None:
         return "radius_largest_ring + extra_length_electrode must be > 0."
     if p.radius_largest_ring + p.extra_length_electrode <= p.via_offset_slice:
         return "Need radius_largest_ring + extra_length_electrode > via_offset_slice."
+    if p.radius_smallest_ring - p.w_rings / 2.0 <= 0:
+        return "Need radius_smallest_ring > w_rings / 2.0 to form ring inner outlines."
     return None
 
 
@@ -477,6 +528,7 @@ class MultiLayerApp(ttk.Frame):
         self._after_id: str | None = None
         self._vars: dict[str, tk.StringVar] = {}
         self._status_var = tk.StringVar(value="")
+        self._initial_params = _load_last_params()
 
         self.grid_columnconfigure(0, minsize=SIDEBAR_MIN)
         self.grid_columnconfigure(1, weight=1)
@@ -489,7 +541,7 @@ class MultiLayerApp(ttk.Frame):
         form.pack(fill=tk.X)
 
         for row, (key, label, _kind) in enumerate(FIELD_SPEC):
-            v = tk.StringVar(value=str(getattr(DEFAULT, key)))
+            v = tk.StringVar(value=str(getattr(self._initial_params, key)))
             self._vars[key] = v
             v.trace_add("write", self._schedule_redraw)
             ttk.Label(form, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=3)
@@ -540,6 +592,9 @@ class MultiLayerApp(ttk.Frame):
         self.master.destroy()
 
     def _schedule_redraw(self, *_args: object) -> None:
+        p = self._try_params()
+        if p is not None:
+            _save_params(p)
         if self._after_id is not None:
             self.after_cancel(self._after_id)
         self._after_id = self.after(REDRAW_MS, self._do_redraw)
